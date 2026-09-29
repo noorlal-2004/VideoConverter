@@ -23,8 +23,9 @@ import java.io.File
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
+import androidx.annotation.OptIn
 
-@UnstableApi
+@OptIn(UnstableApi::class)
 class VideoConverter(private val context: Context) {
 
     /** Must be called from the main thread (viewModelScope does this). */
@@ -38,13 +39,10 @@ class VideoConverter(private val context: Context) {
         val output = File(context.cacheDir, "converted_${System.currentTimeMillis()}.mp4")
 
         // Work out the output size and bitrate
-        val outHeight = minOf(settings.resolution.height ?: info.height, info.height)
-        val outWidth = info.width * outHeight / info.height
-        val bitrate = (outWidth * outHeight * 30 * settings.quality.bitsPerPixel)
-            .toInt().coerceAtLeast(500_000)
+        val plan = ConversionPlan.create(info, settings)
 
         val videoEffects = buildList<Effect> {
-            if (outHeight != info.height) add(Presentation.createForHeight(outHeight))
+            if (plan.outHeight != info.height) add(Presentation.createForHeight(plan.outHeight))
         }
         val editedItem = EditedMediaItem.Builder(MediaItem.fromUri(input))
             .setEffects(Effects(emptyList(), videoEffects))
@@ -52,7 +50,7 @@ class VideoConverter(private val context: Context) {
 
         val encoderFactory = DefaultEncoderFactory.Builder(context)
             .setRequestedVideoEncoderSettings(
-                VideoEncoderSettings.Builder().setBitrate(bitrate).build()
+                VideoEncoderSettings.Builder().setBitrate(plan.videoBitrate).build()
             )
             .build()
 

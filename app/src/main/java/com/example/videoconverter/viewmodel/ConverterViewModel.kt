@@ -2,89 +2,99 @@ package com.example.videoconverter.viewmodel
 
 import android.app.Application
 import android.net.Uri
+import android.text.format.Formatter
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.media3.common.util.UnstableApi
-import com.example.videoconverter.converter.VideoConverter
-import com.example.videoconverter.model.ConversionSettings
-import com.example.videoconverter.model.VideoInfo
-import com.example.videoconverter.util.MediaStoreSaver
+import com.example.videoconverter.converter.ConversionManager
+import com.example.videoconverter.converter.ConversionPlan
+import com.example.videoconverter.model.*
+import com.example.videoconverter.service.ConversionService
+import com.example.videoconverter.util.CodecSupport
+import com.example.videoconverter.util.StorageChecker
 import com.example.videoconverter.util.VideoInfoReader
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-sealed interface ConversionStatus {
-    data object Idle : ConversionStatus
-    data class Running(val progress: Float) : ConversionStatus
-    data class Done(val outputUri: Uri, val inputSize: Long, val outputSize: Long) : ConversionStatus
-    data class Failed(val message: String) : ConversionStatus
-}
 
 data class UiState(
     val videoUri: Uri? = null,
     val info: VideoInfo? = null,
     val settings: ConversionSettings = ConversionSettings(),
-    val status: ConversionStatus = ConversionStatus.Idle
+    val status: ConversionStatus = ConversionStatus.Idle,
+    val pickError: String? = null
 )
 
-@UnstableApi
 class ConverterViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val _state = MutableStateFlow(UiState())
-    val state: StateFlow<UiState> = _state.asStateFlow()
+    // The `status` field of this flow is unused; the real status comes from ConversionManager.
+    private val local = MutableStateFlow(UiState())
 
-    private val converter = VideoConverter(app)
-    private var job: Job? = null
+    val state: StateFlow<UiState> = combine(local, ConversionManager.status) { l, status ->
+        l.copy(status = status)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState())
+
+    val h265Supported: Boolean = CodecSupport.hasEncoder(Codec.H265.mime)
+
+    init {
+        if (!h265Supported) {
+            local.update { it.copy(settings = it.settings.copy(codec = Codec.H264)) }
+        }
+    }
 
     fun onVideoPicked(uri: Uri?) {
         if (uri == null) return
         viewModelScope.launch {
-            val info = withContext(Dispatchers.IO) { VideoInfoReader.read(getApplication(), uri) }
-            _state.update { UiState(videoUri = uri, info = info, settings = it.settings) }
-        }
-    }
-
-    fun updateSettings(change: (ConversionSettings) -> ConversionSettings) {
-        _state.update { it.copy(settings = change(it.settings)) }
-    }
-
-    fun convert() {
-        val s = _state.value
-        val uri = s.videoUri ?: return
-        val info = s.info ?: return
-
-        job = viewModelScope.launch {
-            _state.update { it.copy(status = ConversionStatus.Running(0f)) }
-            try {
-                val file = converter.convert(uri, info, s.settings) { p ->
-                    _state.update { it.copy(status = ConversionStatus.Running(p)) }
+            val result = withContext(Dispatchers.IO) {
+                runCatching { VideoInfoReader.read(getApplication(), uri) }
+            }
+            val info = result.getOrNull()
+            if (info == null || info.width <= 0 || info.height <= 0 || info.durationMs <= 0) {
+                local.update {
+                    it.copy(
+                        videoUri = null, info = null,
+                        pickError = "This file couldn't be read as a video. Try another one."
+                    )
                 }
-                val outputSize = file.length()
-                val savedUri = withContext(Dispatchers.IO) {
-                    MediaStoreSaver.save(getApplication(), file).also { file.delete() }
-                }
-                _state.update {
-                    it.copy(status = ConversionStatus.Done(savedUri, info.sizeBytes, outputSize))
-                }
-            } catch (e: CancellationException) {
-                _state.update { it.copy(status = ConversionStatus.Idle) }
-                throw e
-            } catch (e: Exception) {
-                _state.update {
-                    it.copy(status = ConversionStatus.Failed(e.message ?: "Conversion failed"))
-                }
+            } else {
+                ConversionManager.reset()
+                local.update { it.copy(videoUri = uri, info = info, pickError = null) }
             }
         }
     }
 
-    fun cancel() {
-        job?.cancel()
+    fun updateSettings(change: (ConversionSettings) -> ConversionSettings) {
+        local.update { it.copy(settings = change(it.settings)) }
     }
+
+    fun convert() {
+        val s = state.value
+        val uri = s.videoUri ?: return
+        val info = s.info ?: return
+        val app = getApplication<Application>()
+
+        if (s.settings.codec == Codec.H265 && !h265Supported) {
+            ConversionManager.set(ConversionStatus.Failed("This phone can't encode H.265. Choose H.264."))
+            return
+        }
+
+        // Free-space check: cache file + final copy, plus a safety margin
+        val plan = ConversionPlan.create(info, s.settings)
+        val needed = plan.estimatedBytes(info.durationMs) * 2 + 50L * 1024 * 1024
+        val available = StorageChecker.availableBytes(app)
+        if (available < needed) {
+            ConversionManager.set(
+                ConversionStatus.Failed(
+                    "Not enough storage. About ${Formatter.formatShortFileSize(app, needed)} " +
+                            "needed, ${Formatter.formatShortFileSize(app, available)} free."
+                )
+            )
+            return
+        }
+
+        ConversionManager.set(ConversionStatus.Running(0f))
+        ConversionService.start(app, uri, info, s.settings)
+    }
+
+    fun cancel() = ConversionService.cancel(getApplication())
 }

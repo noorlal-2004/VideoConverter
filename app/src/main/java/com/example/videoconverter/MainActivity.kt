@@ -8,7 +8,9 @@ import androidx.media3.common.util.UnstableApi
 import com.example.videoconverter.ui.ConverterScreen
 import com.example.videoconverter.ui.theme.VideoConverterTheme
 
-@UnstableApi
+import androidx.annotation.OptIn
+
+@OptIn(UnstableApi::class)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

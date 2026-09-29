@@ -1,13 +1,16 @@
 package com.example.videoconverter.ui
 
-
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.text.format.Formatter
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -17,24 +20,42 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.videoconverter.model.*
-import com.example.videoconverter.viewmodel.ConversionStatus
 import com.example.videoconverter.viewmodel.ConverterViewModel
 
-@UnstableApi
+@OptIn(UnstableApi::class)
 @Composable
 fun ConverterScreen(viewModel: ConverterViewModel = viewModel()) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
+    val running = state.status is ConversionStatus.Running
 
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia()
     ) { uri -> viewModel.onVideoPicked(uri) }
+
+    // Ask for notification permission (Android 13+), then convert either way
+    val notificationPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ -> viewModel.convert() }
+
+    val startConversion = {
+        val needsPermission = Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+        if (needsPermission) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            viewModel.convert()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -45,60 +66,83 @@ fun ConverterScreen(viewModel: ConverterViewModel = viewModel()) {
     ) {
         Text("Video Converter", style = MaterialTheme.typography.headlineMedium)
 
-        Button(onClick = {
-            picker.launch(
-                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
-            )
-        }) {
+        Button(
+            enabled = !running,
+            onClick = {
+                picker.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+                )
+            }
+        ) {
             Text(if (state.videoUri == null) "Pick a video" else "Pick another video")
         }
 
-        // Preview: show the converted video once done, otherwise the original
+        state.pickError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+
         val previewUri = (state.status as? ConversionStatus.Done)?.outputUri ?: state.videoUri
         previewUri?.let { VideoPlayer(it, Modifier.fillMaxWidth().aspectRatio(16f / 9f)) }
 
         state.info?.let { InfoCard(it, context) }
 
         if (state.videoUri != null) {
-            OptionRow("Resolution", Resolution.entries, state.settings.resolution, { it.label }) { r ->
+            OptionRow("Resolution", Resolution.entries, state.settings.resolution,
+                label = { it.label }, enabled = { !running }) { r ->
                 viewModel.updateSettings { it.copy(resolution = r) }
             }
-            OptionRow("Quality", Quality.entries, state.settings.quality, { it.label }) { q ->
+            OptionRow("Quality", Quality.entries, state.settings.quality,
+                label = { it.label }, enabled = { !running }) { q ->
                 viewModel.updateSettings { it.copy(quality = q) }
             }
-            OptionRow("Codec", Codec.entries, state.settings.codec, { it.label }) { c ->
+            OptionRow("Codec", Codec.entries, state.settings.codec,
+                label = { it.label },
+                enabled = { !running && (it != Codec.H265 || viewModel.h265Supported) }) { c ->
                 viewModel.updateSettings { it.copy(codec = c) }
             }
+            if (!viewModel.h265Supported) {
+                Text(
+                    "H.265 isn't available on this phone.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
 
-            when (val s = state.status) {
-                is ConversionStatus.Idle, is ConversionStatus.Failed -> {
-                    if (s is ConversionStatus.Failed) {
-                        Text(s.message, color = MaterialTheme.colorScheme.error)
-                    }
-                    Button(onClick = { viewModel.convert() }, modifier = Modifier.fillMaxWidth()) {
-                        Text("Convert")
+        // Status section: shown whenever a conversion is active or finished
+        when (val s = state.status) {
+            is ConversionStatus.Idle, is ConversionStatus.Failed -> {
+                if (s is ConversionStatus.Failed) {
+                    Text(s.message, color = MaterialTheme.colorScheme.error)
+                }
+                if (state.videoUri != null) {
+                    Button(onClick = { startConversion() }, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (s is ConversionStatus.Failed) "Try again" else "Convert")
                     }
                 }
-                is ConversionStatus.Running -> {
-                    LinearProgressIndicator(progress = { s.progress }, modifier = Modifier.fillMaxWidth())
-                    Text("Converting… ${(s.progress * 100).toInt()}%")
-                    OutlinedButton(onClick = { viewModel.cancel() }) { Text("Cancel") }
-                }
-                is ConversionStatus.Done -> {
-                    Text("Saved to Movies/VideoConverter", style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        "Size: ${Formatter.formatShortFileSize(context, s.inputSize)} → " +
-                                Formatter.formatShortFileSize(context, s.outputSize)
-                    )
-                    Button(onClick = { shareVideo(context, s.outputUri) }) { Text("Share") }
-                    OutlinedButton(onClick = { viewModel.convert() }) { Text("Convert again") }
+            }
+            is ConversionStatus.Running -> {
+                LinearProgressIndicator(progress = { s.progress }, modifier = Modifier.fillMaxWidth())
+                Text("Converting… ${(s.progress * 100).toInt()}%")
+                Text(
+                    "You can leave the app; conversion continues in the background.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedButton(onClick = { viewModel.cancel() }) { Text("Cancel") }
+            }
+            is ConversionStatus.Done -> {
+                Text("Saved to Movies/VideoConverter", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "Size: ${Formatter.formatShortFileSize(context, s.inputSize)} → " +
+                            Formatter.formatShortFileSize(context, s.outputSize)
+                )
+                Button(onClick = { shareVideo(context, s.outputUri) }) { Text("Share") }
+                if (state.videoUri != null) {
+                    OutlinedButton(onClick = { startConversion() }) { Text("Convert again") }
                 }
             }
         }
     }
 }
 
-@UnstableApi
+@OptIn(UnstableApi::class)
 @Composable
 private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -135,6 +179,7 @@ private fun <T> OptionRow(
     options: List<T>,
     selected: T,
     label: (T) -> String,
+    enabled: (T) -> Boolean = { true },
     onSelect: (T) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -144,6 +189,7 @@ private fun <T> OptionRow(
                 FilterChip(
                     selected = option == selected,
                     onClick = { onSelect(option) },
+                    enabled = enabled(option),
                     label = { Text(label(option)) }
                 )
             }
