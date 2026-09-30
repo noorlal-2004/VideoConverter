@@ -30,7 +30,7 @@ object ConversionNotifications {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-    fun progress(context: Context, percent: Int): Notification {
+    fun progress(context: Context, title: String, percent: Int): Notification {
         val cancel = PendingIntent.getService(
             context, 1,
             Intent(context, ConversionService::class.java).setAction(ConversionService.ACTION_CANCEL),
@@ -38,19 +38,19 @@ object ConversionNotifications {
         )
         return NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Converting video")
+            .setContentTitle(title)
             .setContentText("$percent%")
             .setProgress(100, percent, false)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(openAppIntent(context))
-            .addAction(0, "Cancel", cancel)
+            .addAction(0, "Cancel all", cancel)
             .build()
     }
 
-    fun updateProgress(context: Context, percent: Int) {
+    fun updateProgress(context: Context, title: String, percent: Int) {
         context.getSystemService(NotificationManager::class.java)
-            .notify(ID_PROGRESS, progress(context, percent))
+            .notify(ID_PROGRESS, progress(context, title, percent))
     }
 
     fun showResult(context: Context, title: String, text: String) {

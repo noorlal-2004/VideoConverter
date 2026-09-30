@@ -31,4 +31,9 @@ object VideoInfoReader {
             retriever.release()
         }
     }
+    fun displayName(context: Context, uri: Uri): String =
+        context.contentResolver
+            .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            ?: "video"
 }

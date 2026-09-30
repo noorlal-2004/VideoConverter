@@ -5,8 +5,8 @@ import android.net.Uri
 import android.text.format.Formatter
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.videoconverter.converter.ConversionManager
 import com.example.videoconverter.converter.ConversionPlan
+import com.example.videoconverter.converter.QueueManager
 import com.example.videoconverter.model.*
 import com.example.videoconverter.service.ConversionService
 import com.example.videoconverter.util.CodecSupport
@@ -17,21 +17,22 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+data class PickedVideo(val uri: Uri, val name: String, val info: VideoInfo)
+
 data class UiState(
-    val videoUri: Uri? = null,
-    val info: VideoInfo? = null,
+    val picked: List<PickedVideo> = emptyList(),
     val settings: ConversionSettings = ConversionSettings(),
-    val status: ConversionStatus = ConversionStatus.Idle,
-    val pickError: String? = null
+    val queue: List<QueueItem> = emptyList(),
+    val message: String? = null
 )
 
 class ConverterViewModel(app: Application) : AndroidViewModel(app) {
 
-    // The `status` field of this flow is unused; the real status comes from ConversionManager.
+    // The `queue` field of this flow is unused; the real queue comes from QueueManager.
     private val local = MutableStateFlow(UiState())
 
-    val state: StateFlow<UiState> = combine(local, ConversionManager.status) { l, status ->
-        l.copy(status = status)
+    val state: StateFlow<UiState> = combine(local, QueueManager.items) { l, queue ->
+        l.copy(queue = queue)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState())
 
     val h265Supported: Boolean = CodecSupport.hasEncoder(Codec.H265.mime)
@@ -42,29 +43,34 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun onVideoPicked(uri: Uri?) {
-        if (uri == null) return
+    fun onVideosPicked(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val app = getApplication<Application>()
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching { VideoInfoReader.read(getApplication(), uri) }
-            }
-            val info = result.getOrNull()
-            if (info == null || info.width <= 0 || info.height <= 0 || info.durationMs <= 0) {
-                local.update {
-                    it.copy(
-                        videoUri = null, info = null,
-                        pickError = "This file couldn't be read as a video. Try another one."
-                    )
+            val loaded = withContext(Dispatchers.IO) {
+                uris.mapNotNull { uri ->
+                    val info = runCatching { VideoInfoReader.read(app, uri) }.getOrNull()
+                    if (info == null || info.width <= 0 || info.height <= 0 || info.durationMs <= 0) {
+                        null
+                    } else {
+                        PickedVideo(uri, VideoInfoReader.displayName(app, uri), info)
+                    }
                 }
-            } else {
-                ConversionManager.reset()
-                local.update {
-                    it.copy(
-                        videoUri = uri,
-                        info = info,
-                        pickError = null,
-                        // A new video starts with no trim
-                        settings = it.settings.copy(trimStartMs = 0L, trimEndMs = info.durationMs)
+            }
+            val skipped = uris.size - loaded.size
+
+            local.update { s ->
+                if (loaded.isEmpty()) {
+                    s.copy(message = "These files couldn't be read as videos. Try others.")
+                } else {
+                    // Trim only makes sense for a single video; batches use the full length
+                    val trimEnd = if (loaded.size == 1) loaded[0].info.durationMs else 0L
+                    s.copy(
+                        picked = loaded,
+                        settings = s.settings.copy(trimStartMs = 0L, trimEndMs = trimEnd),
+                        message = if (skipped > 0) {
+                            "$skipped file(s) couldn't be read and were skipped."
+                        } else null
                     )
                 }
             }
@@ -83,40 +89,68 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun convert() {
-        val s = state.value
-        val uri = s.videoUri ?: return
-        val info = s.info ?: return
+        val s = local.value
         val app = getApplication<Application>()
-        val audioOnly = s.settings.mode == OutputMode.AUDIO
+        if (s.picked.isEmpty()) return
 
-        if (audioOnly && !info.hasAudio) {
-            ConversionManager.set(ConversionStatus.Failed("This video has no audio track to extract."))
+        val settings = s.settings
+        val audioOnly = settings.mode == OutputMode.AUDIO
+
+        if (!audioOnly && settings.codec == Codec.H265 && !h265Supported) {
+            setMessage("This phone can't encode H.265. Choose H.264.")
             return
         }
-        if (!audioOnly && s.settings.codec == Codec.H265 && !h265Supported) {
-            ConversionManager.set(ConversionStatus.Failed("This phone can't encode H.265. Choose H.264."))
-            return
-        }
 
-        // Free-space check: cache file + final copy, plus a safety margin
-        val plan = ConversionPlan.create(info, s.settings)
-        val needed = plan.estimatedBytes() * 2 + 50L * 1024 * 1024
-        val available = StorageChecker.availableBytes(app)
-        if (available < needed) {
-            ConversionManager.set(
-                ConversionStatus.Failed(
-                    "Not enough storage. About ${Formatter.formatShortFileSize(app, needed)} " +
-                            "needed, ${Formatter.formatShortFileSize(app, available)} free."
-                )
+        val usable = if (audioOnly) s.picked.filter { it.info.hasAudio } else s.picked
+        val noAudio = s.picked.size - usable.size
+        if (usable.isEmpty()) {
+            setMessage(
+                if (s.picked.size == 1) "This video has no audio track to extract."
+                else "None of the selected videos has an audio track."
             )
             return
         }
 
-        ConversionManager.set(ConversionStatus.Running(0f))
-        ConversionService.start(app, uri, info, s.settings)
+        // Storage: all final outputs plus the largest temporary file, plus a margin
+        val estimates = usable.map { ConversionPlan.create(it.info, settings).estimatedBytes() }
+        val needed = estimates.sum() + (estimates.maxOrNull() ?: 0L) + 50L * 1024 * 1024
+        val available = StorageChecker.availableBytes(app)
+        if (available < needed) {
+            setMessage(
+                "Not enough storage. About ${Formatter.formatShortFileSize(app, needed)} " +
+                        "needed, ${Formatter.formatShortFileSize(app, available)} free."
+            )
+            return
+        }
+
+        QueueManager.add(
+            usable.map {
+                QueueItem(
+                    id = QueueManager.newId(),
+                    uri = it.uri,
+                    name = it.name,
+                    info = it.info,
+                    settings = settings
+                )
+            }
+        )
+        local.update {
+            it.copy(
+                picked = emptyList(),
+                message = if (noAudio > 0) "$noAudio video(s) skipped: no audio track." else null
+            )
+        }
+        ConversionService.start(app)
     }
 
-    fun cancel() = ConversionService.cancel(getApplication())
+    fun cancelAll() = ConversionService.cancelAll(getApplication())
+    fun cancelCurrent() = ConversionService.cancelCurrent(getApplication())
+    fun removeItem(id: Long) = QueueManager.remove(id)
+    fun clearFinished() = QueueManager.clearFinished()
+
+    private fun setMessage(text: String) {
+        local.update { it.copy(message = text) }
+    }
 
     private companion object {
         const val MIN_TRIM_MS = 1_000L
