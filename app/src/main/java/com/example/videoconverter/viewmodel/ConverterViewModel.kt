@@ -36,7 +36,17 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState())
 
     val h265Supported: Boolean = CodecSupport.hasEncoder(Codec.H265.mime)
+    // One-time messages for the UI (snackbar)
+    private val _events = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val events: SharedFlow<String> = _events.asSharedFlow()
 
+    fun dismissMessage() {
+        local.update { it.copy(message = null) }
+    }
+
+    fun clearSelection() {
+        local.update { it.copy(picked = emptyList(), message = null) }
+    }
     init {
         if (!h265Supported) {
             local.update { it.copy(settings = it.settings.copy(codec = Codec.H264)) }
@@ -141,6 +151,9 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
         ConversionService.start(app)
+        _events.tryEmit(
+            if (usable.size == 1) "Added to queue" else "Added ${usable.size} videos to queue"
+        )
     }
 
     fun cancelAll() = ConversionService.cancelAll(getApplication())

@@ -3,20 +3,17 @@ package com.example.videoconverter
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.material3.Surface
-import androidx.media3.common.util.UnstableApi
-import com.example.videoconverter.ui.ConverterScreen
+import androidx.activity.enableEdgeToEdge
+import com.example.videoconverter.ui.AppScaffold
 import com.example.videoconverter.ui.theme.VideoConverterTheme
 
-import androidx.annotation.OptIn
-
-@OptIn(UnstableApi::class)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         setContent {
             VideoConverterTheme {
-                Surface { ConverterScreen() }
+                AppScaffold()
             }
         }
     }
