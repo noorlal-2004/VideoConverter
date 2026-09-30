@@ -20,12 +20,13 @@ object VideoInfoReader {
                 val tmp = width; width = height; height = tmp
             }
             val duration = meta(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            val hasAudio = meta(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes"
 
             val size = context.contentResolver
                 .query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
                 ?.use { c -> if (c.moveToFirst()) c.getLong(0) else 0L } ?: 0L
 
-            return VideoInfo(width, height, duration, size)
+            return VideoInfo(width, height, duration, size, hasAudio)
         } finally {
             retriever.release()
         }

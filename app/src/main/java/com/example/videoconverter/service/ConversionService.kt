@@ -41,7 +41,6 @@ class ConversionService : Service() {
     }
 
     private fun startConversion(intent: Intent) {
-        // Must call startForeground quickly after startForegroundService()
         ServiceCompat.startForeground(
             this, ConversionNotifications.ID_PROGRESS,
             ConversionNotifications.progress(this, 0),
@@ -59,10 +58,15 @@ class ConversionService : Service() {
             sizeBytes = intent.getLongExtra(EXTRA_SIZE, 0)
         )
         val settings = ConversionSettings(
+            mode = OutputMode.valueOf(intent.getStringExtra(EXTRA_MODE)!!),
             resolution = Resolution.valueOf(intent.getStringExtra(EXTRA_RESOLUTION)!!),
             quality = Quality.valueOf(intent.getStringExtra(EXTRA_QUALITY)!!),
-            codec = Codec.valueOf(intent.getStringExtra(EXTRA_CODEC)!!)
+            codec = Codec.valueOf(intent.getStringExtra(EXTRA_CODEC)!!),
+            trimStartMs = intent.getLongExtra(EXTRA_TRIM_START, 0L),
+            trimEndMs = intent.getLongExtra(EXTRA_TRIM_END, 0L),
+            targetSizeMb = intent.getIntExtra(EXTRA_TARGET_MB, 0).takeIf { it > 0 }
         )
+        val audioOnly = settings.mode == OutputMode.AUDIO
 
         job = scope.launch {
             var lastPercent = -1
@@ -78,11 +82,16 @@ class ConversionService : Service() {
                 }
                 val outputSize = file.length()
                 val savedUri = withContext(Dispatchers.IO) {
-                    MediaStoreSaver.save(this@ConversionService, file).also { file.delete() }
+                    MediaStoreSaver.save(this@ConversionService, file, audioOnly)
+                        .also { file.delete() }
                 }
-                ConversionManager.set(ConversionStatus.Done(savedUri, info.sizeBytes, outputSize))
+                ConversionManager.set(
+                    ConversionStatus.Done(savedUri, info.sizeBytes, outputSize, audioOnly)
+                )
                 ConversionNotifications.showResult(
-                    this@ConversionService, "Conversion complete", "Saved to Movies/VideoConverter"
+                    this@ConversionService,
+                    "Conversion complete",
+                    if (audioOnly) "Saved to Music/VideoConverter" else "Saved to Movies/VideoConverter"
                 )
             } catch (e: CancellationException) {
                 ConversionManager.reset()
@@ -97,7 +106,6 @@ class ConversionService : Service() {
             }
         }
     }
-
     override fun onDestroy() {
         scope.cancel()
         super.onDestroy()
@@ -111,9 +119,13 @@ class ConversionService : Service() {
         private const val EXTRA_HEIGHT = "height"
         private const val EXTRA_DURATION = "duration"
         private const val EXTRA_SIZE = "size"
+        private const val EXTRA_MODE = "mode"
         private const val EXTRA_RESOLUTION = "resolution"
         private const val EXTRA_QUALITY = "quality"
         private const val EXTRA_CODEC = "codec"
+        private const val EXTRA_TRIM_START = "trim_start"
+        private const val EXTRA_TRIM_END = "trim_end"
+        private const val EXTRA_TARGET_MB = "target_mb"
 
         fun start(context: Context, uri: Uri, info: VideoInfo, settings: ConversionSettings) {
             val intent = Intent(context, ConversionService::class.java).apply {
@@ -123,9 +135,13 @@ class ConversionService : Service() {
                 putExtra(EXTRA_HEIGHT, info.height)
                 putExtra(EXTRA_DURATION, info.durationMs)
                 putExtra(EXTRA_SIZE, info.sizeBytes)
+                putExtra(EXTRA_MODE, settings.mode.name)
                 putExtra(EXTRA_RESOLUTION, settings.resolution.name)
                 putExtra(EXTRA_QUALITY, settings.quality.name)
                 putExtra(EXTRA_CODEC, settings.codec.name)
+                putExtra(EXTRA_TRIM_START, settings.trimStartMs)
+                putExtra(EXTRA_TRIM_END, settings.trimEndMs)
+                putExtra(EXTRA_TARGET_MB, settings.targetSizeMb ?: 0)
             }
             ContextCompat.startForegroundService(context, intent)
         }
@@ -135,5 +151,4 @@ class ConversionService : Service() {
                 Intent(context, ConversionService::class.java).setAction(ACTION_CANCEL)
             )
         }
-    }
-}
+    }}

@@ -29,7 +29,8 @@ object ConversionErrors {
 
             ExportException.ERROR_CODE_MUXING_FAILED ->
                 "Couldn't write the converted file. Check your free storage."
-
+            ExportException.ERROR_CODE_FAILED_RUNTIME_CHECK ->
+                "These settings can't be applied to this video. If you chose Audio only, the video may have no audio."
             else -> "Conversion failed (code ${e.errorCode}). Try different settings."
         }
 

@@ -11,6 +11,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -26,6 +27,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import com.example.videoconverter.converter.ConversionPlan
 import com.example.videoconverter.model.*
 import com.example.videoconverter.viewmodel.ConverterViewModel
 
@@ -40,7 +42,6 @@ fun ConverterScreen(viewModel: ConverterViewModel = viewModel()) {
         ActivityResultContracts.PickVisualMedia()
     ) { uri -> viewModel.onVideoPicked(uri) }
 
-    // Ask for notification permission (Android 13+), then convert either way
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { _ -> viewModel.convert() }
@@ -82,31 +83,79 @@ fun ConverterScreen(viewModel: ConverterViewModel = viewModel()) {
         val previewUri = (state.status as? ConversionStatus.Done)?.outputUri ?: state.videoUri
         previewUri?.let { VideoPlayer(it, Modifier.fillMaxWidth().aspectRatio(16f / 9f)) }
 
-        state.info?.let { InfoCard(it, context) }
+        val info = state.info
+        if (info != null) InfoCard(info, context)
 
-        if (state.videoUri != null) {
-            OptionRow("Resolution", Resolution.entries, state.settings.resolution,
-                label = { it.label }, enabled = { !running }) { r ->
-                viewModel.updateSettings { it.copy(resolution = r) }
+        if (state.videoUri != null && info != null) {
+            val settings = state.settings
+            val audioOnly = settings.mode == OutputMode.AUDIO
+
+            OptionRow(
+                "Output", OutputMode.entries, settings.mode,
+                label = { it.label }, enabled = { !running }
+            ) { m -> viewModel.updateSettings { it.copy(mode = m) } }
+
+            if (!audioOnly) {
+                OptionRow(
+                    "Preset", Preset.entries,
+                    Preset.entries.firstOrNull { it.matches(settings) },
+                    label = { it.label }, enabled = { !running }
+                ) { p -> viewModel.updateSettings { p.applyTo(it) } }
+
+                OptionRow(
+                    "Resolution", Resolution.entries, settings.resolution,
+                    label = { it.label }, enabled = { !running }
+                ) { r -> viewModel.updateSettings { it.copy(resolution = r) } }
+
+                OptionRow(
+                    "Quality", Quality.entries, settings.quality,
+                    label = { it.label }, enabled = { !running }
+                ) { q -> viewModel.updateSettings { it.copy(quality = q) } }
+
+                OptionRow(
+                    "Codec", Codec.entries, settings.codec,
+                    label = { it.label },
+                    enabled = { !running && (it != Codec.H265 || viewModel.h265Supported) }
+                ) { c -> viewModel.updateSettings { it.copy(codec = c) } }
+                if (!viewModel.h265Supported) {
+                    Text("H.265 isn't available on this phone.", style = MaterialTheme.typography.bodySmall)
+                }
+
+                OptionRow<Int?>(
+                    "Target size (max)", listOf(null, 10, 25, 50, 100), settings.targetSizeMb,
+                    label = { mb -> mb?.let { "$it MB" } ?: "Off" },
+                    enabled = { !running }
+                ) { mb -> viewModel.updateSettings { it.copy(targetSizeMb = mb) } }
             }
-            OptionRow("Quality", Quality.entries, state.settings.quality,
-                label = { it.label }, enabled = { !running }) { q ->
-                viewModel.updateSettings { it.copy(quality = q) }
-            }
-            OptionRow("Codec", Codec.entries, state.settings.codec,
-                label = { it.label },
-                enabled = { !running && (it != Codec.H265 || viewModel.h265Supported) }) { c ->
-                viewModel.updateSettings { it.copy(codec = c) }
-            }
-            if (!viewModel.h265Supported) {
+
+            TrimSection(
+                info = info,
+                settings = settings,
+                enabled = !running,
+                onChange = { start, end -> viewModel.updateTrim(start, end) }
+            )
+
+            val plan = remember(info, settings) { ConversionPlan.create(info, settings) }
+            Text(
+                "Estimated size: about ${Formatter.formatShortFileSize(context, plan.estimatedBytes())}",
+                style = MaterialTheme.typography.titleSmall
+            )
+            if (!audioOnly && plan.lowQualityWarning) {
                 Text(
-                    "H.265 isn't available on this phone.",
+                    "This target is very small for this video, so quality will be low. " +
+                            "Try a larger target, a lower resolution, or a shorter trim.",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            if (settings.targetSizeMb != null && !audioOnly) {
+                Text(
+                    "Encoders can overshoot a little, so the result may slightly exceed the target.",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
         }
 
-        // Status section: shown whenever a conversion is active or finished
         when (val s = state.status) {
             is ConversionStatus.Idle, is ConversionStatus.Failed -> {
                 if (s is ConversionStatus.Failed) {
@@ -128,18 +177,51 @@ fun ConverterScreen(viewModel: ConverterViewModel = viewModel()) {
                 OutlinedButton(onClick = { viewModel.cancel() }) { Text("Cancel") }
             }
             is ConversionStatus.Done -> {
-                Text("Saved to Movies/VideoConverter", style = MaterialTheme.typography.titleSmall)
+                val where = if (s.audioOnly) "Music/VideoConverter" else "Movies/VideoConverter"
+                Text("Saved to $where", style = MaterialTheme.typography.titleSmall)
                 Text(
                     "Size: ${Formatter.formatShortFileSize(context, s.inputSize)} → " +
                             Formatter.formatShortFileSize(context, s.outputSize)
                 )
-                Button(onClick = { shareVideo(context, s.outputUri) }) { Text("Share") }
+                Button(onClick = { shareMedia(context, s.outputUri, s.audioOnly) }) { Text("Share") }
                 if (state.videoUri != null) {
                     OutlinedButton(onClick = { startConversion() }) { Text("Convert again") }
                 }
             }
         }
     }
+}
+
+@kotlin.OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TrimSection(
+    info: VideoInfo,
+    settings: ConversionSettings,
+    enabled: Boolean,
+    onChange: (Long, Long) -> Unit
+) {
+    val start = settings.trimStartMs
+    val end = settings.effectiveEndMs(info)
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Trim", style = MaterialTheme.typography.titleSmall)
+        RangeSlider(
+            value = start.toFloat()..end.toFloat(),
+            onValueChange = { range -> onChange(range.start.toLong(), range.endInclusive.toLong()) },
+            valueRange = 0f..info.durationMs.toFloat(),
+            enabled = enabled
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(formatTime(start), style = MaterialTheme.typography.bodySmall)
+            Text("Length ${formatTime(end - start)}", style = MaterialTheme.typography.bodySmall)
+            Text(formatTime(end), style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+private fun formatTime(ms: Long): String {
+    val totalSeconds = ms / 1000
+    return "%d:%02d".format(totalSeconds / 60, totalSeconds % 60)
 }
 
 @OptIn(UnstableApi::class)
@@ -163,12 +245,12 @@ private fun VideoPlayer(uri: Uri, modifier: Modifier = Modifier) {
 
 @Composable
 private fun InfoCard(info: VideoInfo, context: Context) {
-    val seconds = info.durationMs / 1000
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("${info.width} × ${info.height}")
-            Text("Duration: %d:%02d".format(seconds / 60, seconds % 60))
+            Text("Duration: ${formatTime(info.durationMs)}")
             Text("Size: ${Formatter.formatShortFileSize(context, info.sizeBytes)}")
+            if (!info.hasAudio) Text("No audio track")
         }
     }
 }
@@ -177,14 +259,17 @@ private fun InfoCard(info: VideoInfo, context: Context) {
 private fun <T> OptionRow(
     title: String,
     options: List<T>,
-    selected: T,
+    selected: T?,
     label: (T) -> String,
     enabled: (T) -> Boolean = { true },
     onSelect: (T) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(title, style = MaterialTheme.typography.titleSmall)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             options.forEach { option ->
                 FilterChip(
                     selected = option == selected,
@@ -197,11 +282,11 @@ private fun <T> OptionRow(
     }
 }
 
-private fun shareVideo(context: Context, uri: Uri) {
+private fun shareMedia(context: Context, uri: Uri, audioOnly: Boolean) {
     val intent = Intent(Intent.ACTION_SEND).apply {
-        type = "video/mp4"
+        type = if (audioOnly) "audio/mp4" else "video/mp4"
         putExtra(Intent.EXTRA_STREAM, uri)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
-    context.startActivity(Intent.createChooser(intent, "Share video"))
+    context.startActivity(Intent.createChooser(intent, "Share"))
 }

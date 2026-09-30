@@ -58,7 +58,15 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } else {
                 ConversionManager.reset()
-                local.update { it.copy(videoUri = uri, info = info, pickError = null) }
+                local.update {
+                    it.copy(
+                        videoUri = uri,
+                        info = info,
+                        pickError = null,
+                        // A new video starts with no trim
+                        settings = it.settings.copy(trimStartMs = 0L, trimEndMs = info.durationMs)
+                    )
+                }
             }
         }
     }
@@ -67,20 +75,32 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         local.update { it.copy(settings = change(it.settings)) }
     }
 
+    fun updateTrim(startMs: Long, endMs: Long) {
+        if (endMs - startMs < MIN_TRIM_MS) return
+        local.update {
+            it.copy(settings = it.settings.copy(trimStartMs = startMs, trimEndMs = endMs))
+        }
+    }
+
     fun convert() {
         val s = state.value
         val uri = s.videoUri ?: return
         val info = s.info ?: return
         val app = getApplication<Application>()
+        val audioOnly = s.settings.mode == OutputMode.AUDIO
 
-        if (s.settings.codec == Codec.H265 && !h265Supported) {
+        if (audioOnly && !info.hasAudio) {
+            ConversionManager.set(ConversionStatus.Failed("This video has no audio track to extract."))
+            return
+        }
+        if (!audioOnly && s.settings.codec == Codec.H265 && !h265Supported) {
             ConversionManager.set(ConversionStatus.Failed("This phone can't encode H.265. Choose H.264."))
             return
         }
 
         // Free-space check: cache file + final copy, plus a safety margin
         val plan = ConversionPlan.create(info, s.settings)
-        val needed = plan.estimatedBytes(info.durationMs) * 2 + 50L * 1024 * 1024
+        val needed = plan.estimatedBytes() * 2 + 50L * 1024 * 1024
         val available = StorageChecker.availableBytes(app)
         if (available < needed) {
             ConversionManager.set(
@@ -97,4 +117,8 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun cancel() = ConversionService.cancel(getApplication())
+
+    private companion object {
+        const val MIN_TRIM_MS = 1_000L
+    }
 }
